@@ -63,7 +63,7 @@ function rewardSigner() {
 function fomoTradeOwners(tx: any, mint: string, pool: string) {
   if (!tx || tx.meta?.err || !tx.blockTime) throw new Error("Fomo buy is not confirmed");
   const keys = tx.transaction.message.accountKeys;
-  const key = (k: any) => k.pubkey.toBase58();
+  const key = (k: any) => typeof k.pubkey === 'string' ? k.pubkey : k.pubkey.toBase58();
   if (key(keys[0]) !== FOMO_COSIGNER || !keys[0].signer || !keys.some((k: any) => key(k) === FOMO_FEE_ACCOUNT) || !keys.some((k: any) => key(k) === pool)) throw new Error("This transaction is not a qualifying Fomo trade for this pool");
   const sourceOwners = new Map<string,string>();
   for (const balance of [...(tx.meta.preTokenBalances || []),...(tx.meta.postTokenBalances || [])]) {
@@ -90,6 +90,29 @@ function fomoTradeOwners(tx: any, mint: string, pool: string) {
   const before = sums(tx.meta.preTokenBalances), after = sums(tx.meta.postTokenBalances);
   return [...after].filter(([wallet, balance]) => balance > (before.get(wallet) || 0n) && feePayers.has(wallet))
     .map(([wallet, balance]) => ({ wallet, boughtAmount: balance - (before.get(wallet) || 0n) }));
+}
+// web3.js 1.98 rejects parsed version-1 receipts before our verifier sees
+// them. Read the JSON-RPC parsed shape directly as a narrow fallback; the
+// same Fomo cosigner, fee transfer, pool and token-balance checks still apply.
+async function parsedReceipt(signature: string) {
+  const response = await fetch(RPC,{
+    method:'POST',headers:{'content-type':'application/json'},
+    body:JSON.stringify({jsonrpc:'2.0',id:1,method:'getTransaction',params:[signature,{encoding:'jsonParsed',commitment:'confirmed',maxSupportedTransactionVersion:1}]}),
+    signal:AbortSignal.timeout(15_000),
+  });
+  if (!response.ok) throw new Error(`RPC receipt request failed: ${response.status}`);
+  const data = await response.json();
+  if (data.error) throw new Error(`RPC receipt error: ${data.error.message || data.error.code}`);
+  return data.result;
+}
+async function parsedReceipts(signatures: string[]) {
+  try { return await rpc.getParsedTransactions(signatures,{commitment:'confirmed',maxSupportedTransactionVersion:1}); }
+  catch (err:any) {
+    if (!/At path: version|Expected the value to satisfy a union/.test(err?.message || '')) throw err;
+    const results:any[] = [];
+    for (let i=0;i<signatures.length;i+=3) results.push(...await Promise.all(signatures.slice(i,i+3).map(parsedReceipt)));
+    return results;
+  }
 }
 async function holderBalance(wallet: string, mint: string) {
   const accounts = await rpc.getParsedTokenAccountsByOwner(new PublicKey(wallet), { mint: new PublicKey(mint) }, "confirmed");
@@ -137,7 +160,7 @@ async function scanFomoTrades(sql: any, launch: any) {
   const next = scanWindow(scan, signatures, new Date(launch.launched_at).getTime());
   const transactions: any[] = [];
   for (let i = 0; i < signatures.length; i += 10) {
-    const batch = await rpc.getParsedTransactions(signatures.slice(i,i+10).map((s:any)=>s.signature),{commitment:"confirmed",maxSupportedTransactionVersion:1});
+    const batch = await parsedReceipts(signatures.slice(i,i+10).map((s:any)=>s.signature));
     transactions.push(...batch);
   }
   let found = 0;
