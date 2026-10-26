@@ -1,0 +1,16 @@
+.install-shell{padding-bottom:60px}.install-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;max-width:900px}.install-card{padding:26px;min-height:300px}.install-card img{display:block;border-radius:17px;margin-bottom:16px}.install-card h2{font-weight:500;font-size:24px;margin:12px 0}.install-card p{color:#aaa8ba;line-height:1.6}.install-card .install-hint{font-size:11px;color:#858397;margin-top:19px}.install-actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:25px}.install-card button{cursor:pointer}.install-card button[hidden]{display:none}.installed-app .nav a[data-nav="install"],.installed-app .nav a[href="/app"]{display:none}@media(display-mode:standalone){.nav a[data-nav="install"],.nav a[href="/app"]{display:none}}body{padding-bottom:env(safe-area-inset-bottom)}@media(max-width:720px){.install-grid{grid-template-columns:1fr}.install-card{min-height:0;padding:22px}.install-actions a{flex:1;min-width:130px;text-align:center}}
+.install-platform{display:flex;flex-direction:column;align-items:flex-start;min-height:370px}
+.install-platform-head{display:flex;width:100%;align-items:flex-start;justify-content:space-between}
+.install-platform-head img{margin:0;border-radius:12px}
+.install-platform-label{font-size:11px;letter-spacing:.16em;color:#b2b5ff}
+.install-platform h2{margin:17px 0 3px}
+.install-platform .install-download{margin-top:auto;white-space:nowrap}
+.iphone-steps{padding-left:20px;margin:6px 0 17px;color:#c8c5d5;line-height:1.6}
+.iphone-steps li+li{margin-top:4px}
+.iphone-steps b{font-weight:500;color:#f3f2f8}
+.install-copy-status{display:block;font-size:11px;color:#b2b5ff;margin-top:8px;min-height:1em}
+.install-wallet{max-width:900px;margin-top:14px;min-height:0;display:flex;align-items:center;justify-content:space-between;gap:22px}
+.install-wallet .install-actions{margin:0;flex-shrink:0}
+.install-wallet h2{font-size:20px}
+.install-wallet p{max-width:55ch;margin-bottom:0}
+@media(max-width:720px){.install-platform{min-height:0}.install-platform .install-download{margin-top:12px}.install-wallet{display:block}.install-wallet .install-actions{margin-top:18px}}

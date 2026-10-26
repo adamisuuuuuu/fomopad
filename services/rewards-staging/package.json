@@ -1,0 +1,15 @@
+{
+  "name": "fomopad-rewards-staging",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run server.ts"
+  },
+  "dependencies": {
+    "postgres": "3.4.7",
+    "@solana/web3.js": "1.98.4",
+    "bn.js": "5.2.2",
+    "@meteora-ag/dynamic-bonding-curve-sdk": "1.5.13"
+  }
+}

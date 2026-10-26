@@ -1,0 +1,14 @@
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.fomopad.app",
+      "sha256_cert_fingerprints": [
+        "6B:5B:42:05:85:BE:DF:F6:8A:58:2E:DB:76:A5:9B:74:88:08:2E:FE:1F:67:9D:0E:92:3F:65:EC:98:41:29:85"
+      ]
+    }
+  }
+]

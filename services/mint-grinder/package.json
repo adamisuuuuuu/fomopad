@@ -1,0 +1,13 @@
+{
+  "name": "fomopad-mint-grinder",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run server.ts"
+  },
+  "dependencies": {
+    "postgres": "3.4.7",
+    "bs58": "6.0.0"
+  }
+}

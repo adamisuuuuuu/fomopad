@@ -1,0 +1,20 @@
+import { join } from "node:path";
+const root=join(import.meta.dir,"public");
+const styleFiles=["style-base.css","style-extra.css","style-fee-route.css","style-claim.css","style-install.css","style-safety.css"];
+const csp="default-src 'self'; script-src 'self' https://esm.sh; worker-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' https: blob: data:; connect-src 'self' https://fomopad-api-production.up.railway.app https://esm.sh; frame-src 'none'; object-src 'none'; base-uri 'self'";
+Bun.serve({port:Number(Bun.env.PORT||3000),async fetch(req){
+ const path=new URL(req.url).pathname;
+ if(path==="/health")return Response.json({ok:true,site:"fomopad",font:"Outfit",source:"github"});
+ if(path==="/download/android")return Response.redirect("https://downloads.fomopad.name/Fomopad-Android-v1.0.0.apk",302);
+ if(path==="/style.css")return new Response((await Promise.all(styleFiles.map(f=>Bun.file(join(root,f)).text()))).join("\n"),{headers:{"content-type":"text/css; charset=utf-8","cache-control":"no-cache"}});
+ let file=path==="/app"||path==="/app/"?"app-showcase.html":path==="/offline"?"offline.html":path==="/privacy"?"privacy.html":path==="/terms"?"terms.html":path==="/delete-account"?"delete-account.html":path.slice(1);
+ const allowed=new Set(["app-showcase.html","offline.html","privacy.html","terms.html","delete-account.html","app.js","boot.js","app-preview.js","manifest.webmanifest","sw.js","icon-192.png","icon-512.png","apple-touch-icon.png","favicon.svg",".well-known/assetlinks.json"]);
+ if(!allowed.has(file))file="index.html";
+ const body=Bun.file(join(root,file));
+ const headers:any={"cache-control":file.endsWith(".png")?"public, max-age=86400":"no-cache","x-content-type-options":"nosniff","referrer-policy":"strict-origin-when-cross-origin"};
+ if(file.endsWith(".html"))headers["content-security-policy"]=csp;
+ if(file.endsWith(".js"))headers["content-type"]="text/javascript; charset=utf-8";
+ if(file.endsWith(".webmanifest"))headers["content-type"]="application/manifest+json; charset=utf-8";
+ if(file.endsWith(".json"))headers["content-type"]="application/json; charset=utf-8";
+ return new Response(body,{headers});
+}});
