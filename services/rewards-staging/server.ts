@@ -5,11 +5,17 @@ import * as DBC from "@meteora-ag/dynamic-bonding-curve-sdk";
 
 const RPC = Bun.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 const REWARD_AUTHORITY = Bun.env.FOMOPAD_REWARD_AUTHORITY ? new PublicKey(Bun.env.FOMOPAD_REWARD_AUTHORITY).toBase58() : null;
+const DBC_PROGRAM = new PublicKey('dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN');
+const TREASURY_WALLET = new PublicKey("6eJteDb9ag7gZviL1kgcQvyLjhJtMMt62Dh31W6nbWhx").toBase58();
+const TREASURY_BPS = 2_000;
 const FOMO_COSIGNER = "AgmLJBMDCqWynYnQiPCuj9ewsNNsBJXyzoUhD9LJzN51";
 const FOMO_FEE_ACCOUNT = "HrTf9CzXR1dRH4Sof5QrpmGWwpwAf3qZzwCsEjQpXcSq";
 const USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 const REWARD_RESERVE = 10_000_000n;
 const MIN_REWARD_CLAIM = 1_000_000n;
+// A fresh treasury recipient can require a token-account rent deposit. Accrue
+// until the claim exceeds that one-time cost instead of draining the gas vault.
+const MIN_TREASURY_CLAIM = 5_000_000n;
 const REWARDS_ACTIVE = Bun.env.FOMOPAD_REWARDS_ACTIVE === "true";
 if (REWARDS_ACTIVE && (!Bun.env.DATABASE_URL || !Bun.env.SOLANA_RPC_URL || !REWARD_AUTHORITY)) throw new Error("Reward worker needs its database, dedicated RPC, and authority address");
 const db = Bun.env.DATABASE_URL ? postgres(Bun.env.DATABASE_URL, { max: 5, idle_timeout: 20 }) : null;
@@ -168,6 +174,15 @@ function splitReward(holders: {wallet: string; balance: bigint}[], amount: bigin
     return { wallet: h.wallet, lamports };
   }).filter(h => h.lamports > 0n);
 }
+function splitWithTreasury(holders: {wallet: string; balance: bigint}[], amount: bigint, bps: number) {
+  if (bps !== 0 && bps !== TREASURY_BPS) throw new Error("Unknown treasury fee plan");
+  const treasury = amount * BigInt(bps) / 10_000n;
+  const allocations = splitReward(holders, amount - treasury);
+  const combined = new Map<string,bigint>();
+  for (const item of allocations) combined.set(item.wallet,(combined.get(item.wallet) || 0n) + item.lamports);
+  if (treasury) combined.set(TREASURY_WALLET,(combined.get(TREASURY_WALLET) || 0n) + treasury);
+  return [...combined].map(([wallet,lamports])=>({wallet,lamports}));
+}
 function signedRewardTransaction(tx: Transaction, signer: Keypair, block: {blockhash: string; lastValidBlockHeight: number}) {
   tx.recentBlockhash = block.blockhash;
   tx.feePayer = signer.publicKey;
@@ -221,9 +236,9 @@ async function advanceReward(mint: string) {
         if (!recipients.length) { await sql`UPDATE reward_epochs SET status = 'needs-review' WHERE id = ${epoch.id}`; return {state:"needs-review",epoch:String(epoch.id)}; }
         const vaultBalance = BigInt(await rpc.getBalance(signer.publicKey, "confirmed"));
         const liabilities = await sql`SELECT coalesce(sum(lamports), 0)::text AS total FROM reward_allocations WHERE status <> 'paid'`;
-        const available = vaultBalance - REWARD_RESERVE - BigInt(liabilities[0].total) - BigInt(recipients.length * 10_000);
+        const available = vaultBalance - REWARD_RESERVE - BigInt(liabilities[0].total) - BigInt((recipients.length + 1) * 10_000);
         if (available < received) return {state:"awaiting-vault-balance",epoch:String(epoch.id)};
-        for (const h of splitReward(recipients, received)) await sql`INSERT INTO reward_allocations (epoch_id,wallet,lamports) VALUES (${epoch.id},${h.wallet},${String(h.lamports)})`;
+        for (const h of splitWithTreasury(recipients, received, Number(launch.treasury_bps || 0))) await sql`INSERT INTO reward_allocations (epoch_id,wallet,lamports) VALUES (${epoch.id},${h.wallet},${String(h.lamports)})`;
         await sql`UPDATE reward_epochs SET status = 'allocating', claimed_lamports = ${String(received)} WHERE id = ${epoch.id}`;
         return { state: "allocating", epoch: String(epoch.id), lamports: String(received) };
       }
@@ -288,6 +303,64 @@ async function advanceReward(mint: string) {
   return result;
 }
 
+// DBC creator-route launches send their 20% partner share straight from the
+// curve to the fixed team treasury. Persist the signed claim before broadcast,
+// so a cron retry cannot create a second claim while the first is uncertain.
+async function advanceTreasury(mint: string) {
+  if (!db) throw new Error("Database is not configured");
+  const result = await db.begin(async sql => {
+    await sql`SELECT pg_advisory_xact_lock(hashtext('rewards:global'))`;
+    await sql`SELECT pg_advisory_xact_lock(hashtext(${"treasury:" + mint}))`;
+    const launches = await sql`SELECT * FROM launches WHERE mint = ${mint} AND status = 'live' AND protocol = 'DBC' AND reward_mode = false AND treasury_bps = ${TREASURY_BPS} LIMIT 1`;
+    if (!launches.length) throw new Error("Active treasury launch not found");
+    const launch = launches[0], signer = rewardSigner();
+    await sql`UPDATE launches SET treasury_tick_at = now() WHERE mint = ${mint}`;
+    const open = await sql`SELECT * FROM treasury_claim_epochs WHERE mint = ${mint} AND status IN ('sent','needs-review') ORDER BY id LIMIT 1 FOR UPDATE`;
+    if (open.length) {
+      const epoch = open[0];
+      if (epoch.status === 'needs-review') return {state:'needs-review',epoch:String(epoch.id)};
+      const tx = await rpc.getTransaction(epoch.signature,{commitment:'confirmed',maxSupportedTransactionVersion:0});
+      if (tx?.meta && !tx.meta.err) {
+        const {keys,instructions} = receiptMessage(tx.transaction.message);
+        const recipientIndex = keys.indexOf(TREASURY_WALLET);
+        const received = recipientIndex < 0 ? 0n : BigInt(tx.meta.postBalances[recipientIndex]) - BigInt(tx.meta.preBalances[recipientIndex]);
+        if (!keys.includes(launch.pool) || !keys.includes(REWARD_AUTHORITY!) || !instructions.some((ix:any)=>keys[ix.programIdIndex]===DBC_PROGRAM.toBase58()) || received < BigInt(epoch.expected_lamports)) {
+          await sql`UPDATE treasury_claim_epochs SET status = 'needs-review' WHERE id = ${epoch.id}`;
+          return {state:'needs-review',epoch:String(epoch.id),reason:'Treasury claim receipt mismatch'};
+        }
+        await sql`UPDATE treasury_claim_epochs SET status = 'complete',completed_at=now() WHERE id = ${epoch.id}`;
+        return {state:'complete',epoch:String(epoch.id),signature:epoch.signature,lamports:String(received)};
+      }
+      const known = await rpc.getSignatureStatuses([epoch.signature],{searchTransactionHistory:true});
+      if (tx?.meta?.err || known.value[0]?.err) {
+        await sql`UPDATE treasury_claim_epochs SET status='failed' WHERE id=${epoch.id}`;
+        return {state:'retry',epoch:String(epoch.id)};
+      }
+      if (!known.value[0] && await rpc.getBlockHeight('confirmed') > Number(epoch.last_valid_height) + 150) {
+        await sql`UPDATE treasury_claim_epochs SET status='needs-review' WHERE id=${epoch.id}`;
+        return {state:'needs-review',epoch:String(epoch.id),reason:'Treasury claim receipt unavailable after expiry'};
+      }
+      return {state:'sent',signature:epoch.signature,raw:epoch.raw};
+    }
+    if (BigInt(await rpc.getBalance(signer.publicKey,'confirmed')) < REWARD_RESERVE + 5_000_000n) return {state:'awaiting-vault-funding'};
+    const client = new DBC.DynamicBondingCurveClient(rpc,'confirmed'), poolKey = new PublicKey(launch.pool);
+    const [pool,config] = await Promise.all([client.state.getPool(poolKey),client.state.getPoolConfig(new PublicKey(launch.config))]);
+    if (!pool || !config || pool.poolState.baseMint.toBase58() !== mint || pool.poolState.config.toBase58() !== launch.config || pool.poolState.creator.toBase58() !== launch.creator || config.feeClaimer.toBase58() !== REWARD_AUTHORITY || Number(config.creatorTradingFeePercentage) !== 80) throw new Error('Treasury pool authority mismatch');
+    const fee = BigInt(pool.poolState.partnerQuoteFee.toString());
+    if (fee < MIN_TREASURY_CLAIM) return {state:'accruing',unclaimedLamports:String(fee)};
+    const tx = await client.partner.claimPartnerTradingFeeToReceiver({pool:poolKey,feeClaimer:signer.publicKey,payer:signer.publicKey,maxBaseAmount:new BN(0),maxQuoteAmount:new BN(fee.toString()),receiver:new PublicKey(TREASURY_WALLET)});
+    const sent = signedRewardTransaction(tx,signer,await rpc.getLatestBlockhash('confirmed'));
+    await sql`INSERT INTO treasury_claim_epochs (mint,signature,raw,last_valid_height,expected_lamports) VALUES (${mint},${sent.signature},${sent.raw},${sent.lastValid},${String(fee)})`;
+    return {state:'sent',signature:sent.signature,raw:sent.raw};
+  });
+  if ('raw' in result && result.raw) {
+    try { await rpc.sendRawTransaction(Buffer.from(result.raw,'base64'),{skipPreflight:false,maxRetries:2}); }
+    catch (err:any) { console.error('Treasury broadcast will retry',result.signature,err?.message); }
+    delete result.raw;
+  }
+  return result;
+}
+
 // A private Railway cron function runs every five minutes. It has no HTTP listener or public domain.
 // Only this worker receives the signing seed; the website API holds the public authority address.
 try {
@@ -307,6 +380,13 @@ try {
           console.error("Reward settlement deferred", item.mint, err?.message || err);
         }
       }));
+    }
+    const treasury = await db!`SELECT mint FROM launches WHERE status = 'live' AND protocol = 'DBC' AND reward_mode = false AND treasury_bps = ${TREASURY_BPS} ORDER BY treasury_tick_at NULLS FIRST, launched_at ASC LIMIT 8`;
+    for (const item of treasury) {
+      try {
+        const result = await advanceTreasury(item.mint);
+        console.log('treasury',item.mint,result.state,result.signature || '');
+      } catch (err:any) { console.error('Treasury settlement deferred',item.mint,err?.message || err); }
     }
   }
 } finally { if (db) await db.end(); }

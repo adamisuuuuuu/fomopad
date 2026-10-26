@@ -25,6 +25,8 @@ const DBC_THRESHOLD_SOL = 88.576623265;
 const REWARD_AUTHORITY = Bun.env.FOMOPAD_REWARD_AUTHORITY ? new PublicKey(Bun.env.FOMOPAD_REWARD_AUTHORITY).toBase58() : null;
 const REWARD_RESERVE = 10_000_000n;
 const REWARDS_ENABLED = Bun.env.FOMOPAD_REWARDS_ENABLED === "true" && !!REWARD_AUTHORITY;
+const TREASURY_WALLET = new PublicKey("6eJteDb9ag7gZviL1kgcQvyLjhJtMMt62Dh31W6nbWhx").toBase58();
+const TREASURY_BPS = 2_000; // 20% of the DBC non-protocol bonding fee share, on new launches.
 const MINT_KEY = Bun.env.MINT_ENCRYPTION_KEY ? Buffer.from(Bun.env.MINT_ENCRYPTION_KEY, "hex") : null;
 if (MINT_KEY && MINT_KEY.length !== 32) throw new Error("MINT_ENCRYPTION_KEY must be 32 bytes in hex");
 const db = Bun.env.DATABASE_URL ? postgres(Bun.env.DATABASE_URL, { max: 5, idle_timeout: 20 }) : null;
@@ -73,6 +75,8 @@ if (db) {
   await db`ALTER TABLE launches ADD COLUMN IF NOT EXISTS quote_mint text`;
   await db`ALTER TABLE launches ADD COLUMN IF NOT EXISTS platform text`;
   await db`ALTER TABLE launches ADD COLUMN IF NOT EXISTS reward_tick_at timestamptz`;
+  await db`ALTER TABLE launches ADD COLUMN IF NOT EXISTS treasury_bps integer NOT NULL DEFAULT 0`;
+  await db`ALTER TABLE launches ADD COLUMN IF NOT EXISTS treasury_tick_at timestamptz`;
   await db`CREATE TABLE IF NOT EXISTS reward_proofs (
     signature text NOT NULL, mint text NOT NULL REFERENCES launches(mint),
     wallet text NOT NULL, bought_at timestamptz NOT NULL, verified_at timestamptz NOT NULL DEFAULT now(),
@@ -99,6 +103,13 @@ if (db) {
     payout_signature text UNIQUE, payout_raw text, payout_last_valid_height bigint,
     paid_at timestamptz, PRIMARY KEY (epoch_id, wallet)
   )`;
+  await db`CREATE TABLE IF NOT EXISTS treasury_claim_epochs (
+    id bigserial PRIMARY KEY, mint text NOT NULL REFERENCES launches(mint),
+    signature text NOT NULL UNIQUE, raw text NOT NULL, last_valid_height bigint NOT NULL,
+    expected_lamports bigint NOT NULL, status text NOT NULL DEFAULT 'sent',
+    created_at timestamptz NOT NULL DEFAULT now(), completed_at timestamptz
+  )`;
+  await db`CREATE UNIQUE INDEX IF NOT EXISTS treasury_claim_one_open ON treasury_claim_epochs (mint) WHERE status IN ('sent','needs-review')`;
   await db`CREATE TABLE IF NOT EXISTS account_deletion_requests (wallet text PRIMARY KEY, requested_at timestamptz NOT NULL DEFAULT now(), status text NOT NULL DEFAULT 'pending')`;
   await db`CREATE TABLE IF NOT EXISTS auth_challenges (nonce_hash text PRIMARY KEY, wallet text NOT NULL, expires_at timestamptz NOT NULL)`;
   await db`CREATE TABLE IF NOT EXISTS auth_sessions (token_hash text PRIMARY KEY, wallet text NOT NULL, expires_at timestamptz NOT NULL)`;
@@ -276,15 +287,15 @@ async function stonkTerms() {
   return { pair, pricing };
 }
 function row(r: any) {
-  return { mint: r.mint, creator: r.creator, name: r.name, symbol: r.symbol, description: r.description, website: r.website, x: r.x_url, telegram: r.telegram, image: `${Bun.env.PUBLIC_API_ORIGIN || ""}/images/${r.mint}`, signature: r.signature, createdAt: r.created_at, launchedAt: r.launched_at, status: r.status, protocol: r.protocol || "Pump", config: r.config, pool: r.pool, platform: r.platform, quoteMint: r.quote_mint, rewardMode: !!r.reward_mode, rewardScope: r.reward_mode ? (r.reward_scope || "holders") : "creator", initialCapSol: r.initial_cap_sol ? Number(r.initial_cap_sol) : null, migrationThresholdSol: r.protocol === "DBC" ? DBC_THRESHOLD_SOL : null };
+  return { mint: r.mint, creator: r.creator, name: r.name, symbol: r.symbol, description: r.description, website: r.website, x: r.x_url, telegram: r.telegram, image: `${Bun.env.PUBLIC_API_ORIGIN || ""}/images/${r.mint}`, signature: r.signature, createdAt: r.created_at, launchedAt: r.launched_at, status: r.status, protocol: r.protocol || "Pump", config: r.config, pool: r.pool, platform: r.platform, quoteMint: r.quote_mint, rewardMode: !!r.reward_mode, rewardScope: r.reward_mode ? (r.reward_scope || "holders") : "creator", treasuryBps: Number(r.treasury_bps || 0), initialCapSol: r.initial_cap_sol ? Number(r.initial_cap_sol) : null, migrationThresholdSol: r.protocol === "DBC" ? DBC_THRESHOLD_SOL : null };
 }
-function dbcCurve(initialCapSol: number, rewardMode = false) {
+function dbcCurve(initialCapSol: number, rewardMode = false, treasuryBps = 0) {
   const ratio = DBC_THRESHOLD_SOL / initialCapSol;
   const capRoot = (ratio + Math.sqrt(ratio * ratio + 4 * ratio)) / 2;
   const percentageSupplyOnMigration = 100 / (1 + capRoot);
   const curve = DBC.buildCurve({
     token: { tokenType: DBC.TokenType.SPLToken, tokenBaseDecimal: DBC.TokenDecimal.SIX, tokenQuoteDecimal: 9, tokenAuthorityOption: DBC.TokenAuthorityOption.Immutable, totalTokenSupply: 1_000_000_000, leftover: 0 },
-    fee: { baseFeeParams: { baseFeeMode: DBC.BaseFeeMode.FeeSchedulerLinear, feeSchedulerParam: { startingFeeBps: 100, endingFeeBps: 100, numberOfPeriod: 0, totalDuration: 0 } }, dynamicFeeEnabled: false, collectFeeMode: DBC.CollectFeeMode.QuoteToken, creatorTradingFeePercentage: rewardMode ? 0 : 100, poolCreationFee: 0, enableFirstSwapWithMinFee: false },
+    fee: { baseFeeParams: { baseFeeMode: DBC.BaseFeeMode.FeeSchedulerLinear, feeSchedulerParam: { startingFeeBps: 100, endingFeeBps: 100, numberOfPeriod: 0, totalDuration: 0 } }, dynamicFeeEnabled: false, collectFeeMode: DBC.CollectFeeMode.QuoteToken, creatorTradingFeePercentage: rewardMode ? 0 : 100 - treasuryBps / 100, poolCreationFee: 0, enableFirstSwapWithMinFee: false },
     migration: { migrationOption: DBC.MigrationOption.MET_DAMM_V2, migrationFeeOption: DBC.MigrationFeeOption.FixedBps200, migrationFee: { feePercentage: 0, creatorFeePercentage: 0 } },
     liquidityDistribution: { partnerLiquidityPercentage: 0, partnerPermanentLockedLiquidityPercentage: 0, creatorLiquidityPercentage: 0, creatorPermanentLockedLiquidityPercentage: 100 },
     lockedVesting: { totalLockedVestingAmount: 0, numberOfVestingPeriod: 0, cliffUnlockAmount: 0, totalVestingDuration: 0, cliffDurationFromMigrationTime: 0 },
@@ -332,7 +343,7 @@ async function boardCurveFor(r: any) {
 }
 
 async function rewardStatus(mint: string) {
-  const launch = await db!`SELECT mint, pool, reward_mode, reward_scope FROM launches WHERE mint = ${mint} AND status = 'live' LIMIT 1`;
+  const launch = await db!`SELECT mint, pool, reward_mode, reward_scope, treasury_bps FROM launches WHERE mint = ${mint} AND status = 'live' LIMIT 1`;
   if (!launch.length) throw new Error("Verified launch not found");
   if (!launch[0].reward_mode) return { enabled: false };
   const [proofs, epochs, payouts, scans, poolState] = await Promise.all([
@@ -342,16 +353,16 @@ async function rewardStatus(mint: string) {
     db!`SELECT completed_at,window_head FROM reward_scans WHERE mint = ${mint}`,
     new DBC.DynamicBondingCurveClient(rpc, "confirmed").state.getPool(new PublicKey(launch[0].pool)),
   ]);
-  return { enabled: true, scope: "DBC bonding fees", rewardScope: launch[0].reward_scope || "holders", eligibility: launch[0].reward_scope === "traders" ? "Verified Fomo buyers of this coin, weighted by cumulative verified buy amount" : "Verified Fomo buyers of this coin who still hold it, weighted by current balance", verifiedWallets: proofs[0].holders,
+  return { enabled: true, scope: "DBC bonding fees", rewardScope: launch[0].reward_scope || "holders", treasuryBps: Number(launch[0].treasury_bps || 0), treasuryWallet: Number(launch[0].treasury_bps || 0) ? TREASURY_WALLET : null, eligibility: launch[0].reward_scope === "traders" ? "Verified Fomo buyers of this coin, weighted by cumulative verified buy amount" : "Verified Fomo buyers of this coin who still hold it, weighted by current balance", verifiedWallets: proofs[0].holders,
     unclaimedQuoteLamports: poolState.poolState.partnerQuoteFee.toString(), authority: REWARD_AUTHORITY,
     lastIndexedAt: scans[0]?.completed_at || null, indexing: !!scans[0]?.window_head,
     epochs: epochs.map((r: any) => ({ id: String(r.id), status: r.status, claimSignature: r.claim_signature, claimedLamports: r.claimed_lamports === null ? null : String(r.claimed_lamports), createdAt: r.created_at })),
-    payouts: payouts.map((r: any) => ({ wallet: r.wallet, lamports: String(r.lamports), status: r.status, signature: r.payout_signature, paidAt: r.paid_at, epoch: String(r.epoch_id) })) };
+    payouts: payouts.map((r: any) => ({ wallet: r.wallet, kind: Number(launch[0].treasury_bps || 0) && r.wallet === TREASURY_WALLET ? "team-treasury" : "verified-fomo-trader", lamports: String(r.lamports), status: r.status, signature: r.payout_signature, paidAt: r.paid_at, epoch: String(r.epoch_id) })) };
 }
 const CREATOR_CLAIM_DISCRIMINATOR = Buffer.from([82,220,250,189,3,85,107,45]);
 const STONK_CREATOR_CLAIM_DISCRIMINATOR = Buffer.from([26,97,138,203,132,171,141,252]);
 async function creatorFees(mint: string) {
-  const records = await db!`SELECT mint,creator,pool,config,platform,quote_mint,protocol,reward_mode FROM launches WHERE mint = ${mint} AND status = 'live' LIMIT 1`;
+  const records = await db!`SELECT mint,creator,pool,config,platform,quote_mint,protocol,reward_mode,treasury_bps FROM launches WHERE mint = ${mint} AND status = 'live' LIMIT 1`;
   if (!records.length) throw new Error("Verified launch not found");
   const launch = records[0];
   if (launch.protocol === "STONK") {
@@ -379,11 +390,12 @@ async function creatorFees(mint: string) {
     return { mode:"stonk-claim", rail:"Stonk.fun / Raydium LaunchLab", creator:launch.creator, pool:launch.pool, program:LAUNCHPAD_PROGRAM.toBase58(), vault:vault.toBase58(), receiver:receiver.toBase58(), quoteMint:SOL_MINT.toBase58(), creatorFeeRate:platform.creatorFeeRate.toString(), claimableQuoteLamports:amount.toString(), scope:"shared-creator-vault", explanation:"Stonk.fun LaunchLab creator fees accrue in one wrapped-SOL vault shared by this wallet's SOL-pair Stonk launches. One claim sweeps the available vault balance into the creator's wrapped-SOL token account; network fees and token-account rent may apply." };
   }
   if (launch.protocol !== "DBC") return { mode:"external", creator:launch.creator, claimableQuoteLamports:"0", explanation:"Fee claims for this legacy rail are not managed by Fomopad." };
-  if (launch.reward_mode) return { mode:"distribution", creator:launch.creator, claimableQuoteLamports:"0", explanation:"Fomopad automatically claims and distributes this DBC fee share to eligible Fomo traders." };
+  if (launch.reward_mode) return { mode:"distribution", creator:launch.creator, treasuryBps:Number(launch.treasury_bps || 0), claimableQuoteLamports:"0", explanation:launch.treasury_bps ? "Fomopad distributes 80% of the DBC non-protocol bonding fee share to eligible Fomo traders and 20% to the team treasury." : "Fomopad automatically claims and distributes this DBC fee share to eligible Fomo traders." };
   const client = new DBC.DynamicBondingCurveClient(rpc,"confirmed");
   const [pool,config] = await Promise.all([client.state.getPool(new PublicKey(launch.pool)),client.state.getPoolConfig(new PublicKey(launch.config))]);
-  if (!pool || !config || pool.poolState.baseMint.toBase58() !== mint || pool.poolState.config.toBase58() !== launch.config || pool.poolState.creator.toBase58() !== launch.creator || config.feeClaimer.toBase58() !== launch.creator || Number(config.creatorTradingFeePercentage) !== 100 || !config.quoteMint.equals(SOL_MINT)) throw new Error("Creator fee route does not match the verified pool");
-  return { mode:"claim", rail:"Meteora DBC", creator:launch.creator, pool:launch.pool, claimableQuoteLamports:pool.poolState.creatorQuoteFee.toString(), quoteMint:SOL_MINT.toBase58(), explanation:"Claim accrued DBC bonding fees to the creator wallet. Wallet approval and network fees are required." };
+  const split = Number(launch.treasury_bps || 0);
+  if (!pool || !config || pool.poolState.baseMint.toBase58() !== mint || pool.poolState.config.toBase58() !== launch.config || pool.poolState.creator.toBase58() !== launch.creator || config.feeClaimer.toBase58() !== (split ? REWARD_AUTHORITY : launch.creator) || Number(config.creatorTradingFeePercentage) !== 100 - split / 100 || !config.quoteMint.equals(SOL_MINT)) throw new Error("Creator fee route does not match the verified pool");
+  return { mode:"claim", rail:"Meteora DBC", creator:launch.creator, pool:launch.pool, treasuryBps:split, treasuryWallet:split ? TREASURY_WALLET : null, claimableQuoteLamports:pool.poolState.creatorQuoteFee.toString(), quoteMint:SOL_MINT.toBase58(), explanation:split ? "Claim your 80% DBC non-protocol bonding fee share. The separate 20% team treasury share is settled on-chain by Fomopad. Wallet approval and network fees are required." : "Claim accrued DBC bonding fees to the creator wallet. Wallet approval and network fees are required." };
 }
 // A cycle is persisted before broadcasting. Retrying sends the same signed transaction.
 // One call advances one stage; a cron and any visitor may advance the same cycle safely.
@@ -399,7 +411,7 @@ Bun.serve({
         await db`SELECT 1`;
         return json({ ok: true, database: true, chain: "solana-mainnet", protocols: ["meteora-dbc", "stonk-launchlab"], rewards: REWARDS_ENABLED ? "bonding-fee-mode" : "unavailable" });
       }
-      if (path === "/api/config") return json({ chain: "solana-mainnet", protocols: ["Meteora DBC", "Stonk.fun / Raydium LaunchLab"], suffix: "fomo", minInitialMarketCapSol: 30, migrationQuoteThresholdSol: DBC_THRESHOLD_SOL, tradingFeeBps: 100, graduation: "DAMM v2", fomoOnlyRewards: REWARDS_ENABLED ? "opt-in-dbc-bonding-fees" : "unavailable", rewardVaultAuthority: REWARD_AUTHORITY });
+      if (path === "/api/config") return json({ chain: "solana-mainnet", protocols: ["Meteora DBC", "Stonk.fun / Raydium LaunchLab"], suffix: "fomo", minInitialMarketCapSol: 30, migrationQuoteThresholdSol: DBC_THRESHOLD_SOL, tradingFeeBps: 100, graduation: "DAMM v2", fomoOnlyRewards: REWARDS_ENABLED ? "opt-in-dbc-bonding-fees" : "unavailable", rewardVaultAuthority: REWARD_AUTHORITY, dbcTreasuryBps:TREASURY_BPS, dbcTreasuryWallet:TREASURY_WALLET, stonkTreasuryShareSupported:false });
       if (path === "/api/stonk/terms" && req.method === "GET") {
         const { pair, pricing } = await stonkTerms();
         return json({ available: true, quote: { mint: pair.mint, symbol: pair.symbol || "SOL", tokenProgram: pair.tokenProgram }, mode: "standard", program: pricing.curve.programId, config: pricing.curve.configId, platform: pricing.platform.standard, openingMarketCap: pricing.marketCap?.startQuote || null, graduationMarketCap: pricing.marketCap?.graduationQuote || null, raiseRaw: pricing.raise.raw, raiseSol: pricing.raise.units || null });
@@ -588,7 +600,7 @@ Bun.serve({
         const records = q
           ? await db`SELECT * FROM launches WHERE status = 'live' AND (name ILIKE ${"%" + q + "%"} OR symbol ILIKE ${"%" + q + "%"} OR mint = ${q}) ORDER BY launched_at DESC LIMIT 50`
           : await db`SELECT * FROM launches WHERE status = 'live' ORDER BY launched_at DESC LIMIT 50`;
-        const paid = await db`SELECT e.mint, COALESCE(SUM(a.lamports),0)::text AS lamports FROM reward_epochs e JOIN reward_allocations a ON a.epoch_id=e.id WHERE a.status='paid' GROUP BY e.mint`;
+        const paid = await db`SELECT e.mint, COALESCE(SUM(a.lamports),0)::text AS lamports FROM reward_epochs e JOIN reward_allocations a ON a.epoch_id=e.id JOIN launches l ON l.mint=e.mint WHERE a.status='paid' AND (l.treasury_bps=0 OR a.wallet <> ${TREASURY_WALLET}) GROUP BY e.mint`;
         const totals = new Map(paid.map((r: any) => [r.mint, r.lamports]));
         const out = await Promise.all(records.map(async r => ({ ...row(r), market: await marketFor(r.mint), curve: await boardCurveFor(r), rewardPaidLamports:totals.get(r.mint) || "0" })));
         return json({ tokens: out, scope:"50 most recent verified launches" });
@@ -703,6 +715,7 @@ Bun.serve({
           const balance = BigInt(await rpc.getBalance(new PublicKey(REWARD_AUTHORITY!),"confirmed"));
           if (balance < REWARD_RESERVE + 10_000_000n) throw new Error("Reward vault needs operating SOL before an opt-in launch");
         }
+        if (isDbc && !REWARDS_ENABLED) throw new Error("DBC treasury settlement is not active yet");
         const config = isDbc ? address(p.config).toBase58() : null;
         if (isDbc || isStonk) {
           const reserved = await db`SELECT mint FROM vanity_mints WHERE mint = ${mint} AND reserved_by = ${creator} AND consumed_at IS NULL LIMIT 1`;
@@ -732,7 +745,7 @@ Bun.serve({
           const prior = await sql`SELECT creator, payload_hash, status, protocol, config, reward_scope FROM launches WHERE mint = ${mint}`;
           const protocol = isDbc ? "DBC" : isStonk ? "STONK" : "Pump";
           if (prior.length && (prior[0].creator !== creator || prior[0].payload_hash !== hash || prior[0].protocol !== protocol || prior[0].config !== config || (rewardMode && prior[0].reward_scope !== rewardScope))) throw new Error("This mint already has a different draft");
-          await sql`INSERT INTO launches (mint, creator, name, symbol, description, website, x_url, telegram, image, image_type, payload_hash, protocol, config, initial_cap_sol, reward_mode, reward_scope, quote_mint) VALUES (${mint}, ${creator}, ${name}, ${symbol}, ${description}, ${website}, ${x}, ${telegram}, ${bytes}, ${type}, ${hash}, ${protocol}, ${config}, ${initialCapSol}, ${rewardMode}, ${rewardScope}, ${isStonk ? SOL_MINT.toBase58() : null}) ON CONFLICT (mint) DO NOTHING`;
+          await sql`INSERT INTO launches (mint, creator, name, symbol, description, website, x_url, telegram, image, image_type, payload_hash, protocol, config, initial_cap_sol, reward_mode, reward_scope, quote_mint, treasury_bps) VALUES (${mint}, ${creator}, ${name}, ${symbol}, ${description}, ${website}, ${x}, ${telegram}, ${bytes}, ${type}, ${hash}, ${protocol}, ${config}, ${initialCapSol}, ${rewardMode}, ${rewardScope}, ${isStonk ? SOL_MINT.toBase58() : null}, ${isDbc ? TREASURY_BPS : 0}) ON CONFLICT (mint) DO NOTHING`;
           await sql`INSERT INTO launch_identities (kind,key,mint) VALUES ('ticker',${ticker},${mint}) ON CONFLICT DO NOTHING`;
           await sql`INSERT INTO launch_identities (kind,key,mint) VALUES ('image',${imageKey},${mint}) ON CONFLICT DO NOTHING`;
           const claims = await sql`SELECT kind,mint FROM launch_identities WHERE (kind='ticker' AND key=${ticker}) OR (kind='image' AND key=${imageKey})`;
@@ -755,13 +768,15 @@ Bun.serve({
         if (!reserved.length) return fail("Reserved mint signer not found", 409);
         const mintKeypair = mintSigner(reserved[0]);
         const config = new PublicKey(r.config);
-        if (r.reward_mode && !REWARDS_ENABLED) return fail("Automatic rewards are not active yet",409);
+        if (!REWARDS_ENABLED) return fail("DBC treasury settlement is not active yet",409);
         if (r.reward_mode && BigInt(await rpc.getBalance(new PublicKey(REWARD_AUTHORITY!),"confirmed")) < REWARD_RESERVE + 10_000_000n) return fail("Reward vault needs operating SOL before launch",409);
-        const curve = dbcCurve(Number(r.initial_cap_sol), !!r.reward_mode);
+        const split = Number(r.treasury_bps || 0);
+        if (split !== TREASURY_BPS) return fail("This draft uses an older DBC fee plan; create a new launch draft",409);
+        const curve = dbcCurve(Number(r.initial_cap_sol), !!r.reward_mode, split);
         const pool = DBC.deriveDbcPoolAddress(SOL_MINT, mint, config);
         const client = new DBC.DynamicBondingCurveClient(rpc, "confirmed");
         const tx = await client.partner.createConfigAndPool({
-          ...curve, config, feeClaimer: r.reward_mode ? new PublicKey(REWARD_AUTHORITY!) : creator, leftoverReceiver: creator, quoteMint: SOL_MINT, payer: creator,
+          ...curve, config, feeClaimer: new PublicKey(REWARD_AUTHORITY!), leftoverReceiver: creator, quoteMint: SOL_MINT, payer: creator,
           preCreatePoolParam: { name: r.name, symbol: r.symbol, uri: `${origin(req)}/metadata/${r.mint}`, poolCreator: creator, baseMint: mint },
         });
         if (tx.instructions.length !== 2 || tx.instructions.some(ix => !ix.programId.equals(DBC_PROGRAM))) throw new Error("Unexpected DBC launch transaction");
@@ -769,7 +784,7 @@ Bun.serve({
         tx.recentBlockhash = block.blockhash; tx.feePayer = creator;
         tx.partialSign(mintKeypair);
         await db`UPDATE launches SET pool = ${pool.toBase58()} WHERE mint = ${r.mint} AND status = 'draft'`;
-        return json({ transaction: tx.serialize({requireAllSignatures:false,verifySignatures:false}).toString("base64"), blockhash: block.blockhash, lastValidBlockHeight: block.lastValidBlockHeight, program: DBC_PROGRAM.toBase58(), pool: pool.toBase58(), config: r.config, metadata: `${origin(req)}/metadata/${r.mint}`, initialCapSol: Number(r.initial_cap_sol), migrationThresholdSol: DBC_THRESHOLD_SOL, rewardMode: !!r.reward_mode, rewardScope: r.reward_mode ? r.reward_scope : "creator", feeClaimer: r.reward_mode ? REWARD_AUTHORITY : creator });
+        return json({ transaction: tx.serialize({requireAllSignatures:false,verifySignatures:false}).toString("base64"), blockhash: block.blockhash, lastValidBlockHeight: block.lastValidBlockHeight, program: DBC_PROGRAM.toBase58(), pool: pool.toBase58(), config: r.config, metadata: `${origin(req)}/metadata/${r.mint}`, initialCapSol: Number(r.initial_cap_sol), migrationThresholdSol: DBC_THRESHOLD_SOL, rewardMode: !!r.reward_mode, rewardScope: r.reward_mode ? r.reward_scope : "creator", feeClaimer: REWARD_AUTHORITY, treasuryBps:split, treasuryWallet:TREASURY_WALLET });
       }
       if (path === "/api/stonk/prepare" && req.method === "POST") {
         rate(req, "stonk-prepare", 20, 3_600_000);
@@ -852,7 +867,8 @@ Bun.serve({
         const client = new DBC.DynamicBondingCurveClient(rpc,"confirmed");
         const state = await client.state.getPool(poolKey);
         const configState = state && await client.state.getPoolConfig(configKey);
-        if (!state || !configState || state.poolState.baseMint.toBase58()!==mint || state.poolState.config.toBase58()!==r.config || state.poolState.creator.toBase58()!==creator || configState.feeClaimer.toBase58() !== (r.reward_mode ? REWARD_AUTHORITY : creator) || Number(configState.creatorTradingFeePercentage) !== (r.reward_mode ? 0 : 100) || !configState.quoteMint.equals(SOL_MINT) || !DBC.deriveDbcPoolAddress(SOL_MINT,new PublicKey(mint),configKey).equals(poolKey) || !configState.migrationQuoteThreshold.eq(DBC.convertToLamports(DBC_THRESHOLD_SOL,9))) return fail("On-chain DBC curve does not match this launch",422);
+        const split = Number(r.treasury_bps || 0);
+        if (!state || !configState || state.poolState.baseMint.toBase58()!==mint || state.poolState.config.toBase58()!==r.config || state.poolState.creator.toBase58()!==creator || configState.feeClaimer.toBase58() !== (r.reward_mode || split ? REWARD_AUTHORITY : creator) || Number(configState.creatorTradingFeePercentage) !== (r.reward_mode ? 0 : 100 - split / 100) || !configState.quoteMint.equals(SOL_MINT) || !DBC.deriveDbcPoolAddress(SOL_MINT,new PublicKey(mint),configKey).equals(poolKey) || !configState.migrationQuoteThreshold.eq(DBC.convertToLamports(DBC_THRESHOLD_SOL,9))) return fail("On-chain DBC curve does not match this launch",422);
         await db`UPDATE launches SET status = 'live', signature = ${sig}, launched_at = COALESCE(launched_at, to_timestamp(${transaction.blockTime || Math.floor(Date.now()/1000)})) WHERE mint = ${mint} AND creator = ${creator} AND (signature IS NULL OR signature = ${sig})`;
         await db`UPDATE vanity_mints SET consumed_at = COALESCE(consumed_at, now()), secret_cipher = NULL, secret_iv = NULL WHERE mint = ${mint} AND reserved_by = ${creator}`;
         return json({status:"live",mint,pool:r.pool,config:r.config,signature:sig});
