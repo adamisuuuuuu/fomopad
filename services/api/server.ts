@@ -35,6 +35,7 @@ const hits = new Map<string, { count: number; reset: number }>();
 const markets = new Map<string, { expires: number; value: any }>();
 const curves = new Map<string, { expires: number; value: any }>();
 const candleCache = new Map<string, { expires: number; value: any }>();
+const tradeCache = new Map<string, { expires: number; value: any }>();
 let mintReplenishment: Promise<void> | null = null;
 const candlePeriods: Record<string, { timeframe: string; aggregate: number }> = {
   "1m": { timeframe: "minute", aggregate: 1 },
@@ -323,7 +324,7 @@ async function marketFor(mint: string) {
       matching.sort((a: any, b: any) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
       if (matching[0]) {
         const p = matching[0];
-        value = { source: "DEX Screener", priceUsd: p.priceUsd ? Number(p.priceUsd) : null, liquidityUsd: p.liquidity?.usd ?? null, volume24hUsd: p.volume?.h24 ?? null, change24hPct: p.priceChange?.h24 ?? null, marketCapUsd: p.marketCap ?? null, buys24h: p.txns?.h24?.buys ?? null, sells24h: p.txns?.h24?.sells ?? null, pair: p.pairAddress, url: p.url };
+        value = { source: "DEX Screener", priceUsd: p.priceUsd ? Number(p.priceUsd) : null, liquidityUsd: p.liquidity?.usd ?? null, volume24hUsd: p.volume?.h24 ?? null, volume1hUsd:p.volume?.h1 ?? null, volume5mUsd:p.volume?.m5 ?? null, change24hPct: p.priceChange?.h24 ?? null, change1hPct:p.priceChange?.h1 ?? null, marketCapUsd: p.marketCap ?? null, buys24h: p.txns?.h24?.buys ?? null, sells24h: p.txns?.h24?.sells ?? null, buys5m:p.txns?.m5?.buys ?? null, sells5m:p.txns?.m5?.sells ?? null, pair: p.pairAddress, url: p.url };
       }
     }
   } catch { /* A missing or delayed index is represented as null. */ }
@@ -630,6 +631,54 @@ Bun.serve({
           ...treasuryClaims.map((r:any)=>({kind:"team-treasury",wallet:TREASURY_WALLET,signature:r.signature,at:r.created_at,status:r.status,amountLamports:String(r.expected_lamports)}))
         ].sort((a,b)=>new Date(b.at || 0).getTime()-new Date(a.at || 0).getTime());
         return json({mint,protocol:launch[0].protocol,route:launch[0].reward_mode ? launch[0].reward_scope : "creator",treasuryBps:Number(launch[0].treasury_bps || 0),treasuryWallet:Number(launch[0].treasury_bps || 0) ? TREASURY_WALLET : null,events,scope:"Fomopad-recorded receipts; historical creator claims before this ledger are not included",amountNote:"Creator claim amounts are not recorded here; inspect their Solana receipts."});
+      }
+      const traderProfileRoute = path.match(/^\/api\/traders\/([^/]+)$/);
+      if (traderProfileRoute && req.method === "GET") {
+        const owner = address(traderProfileRoute[1]).toBase58();
+        const [proofs,payouts] = await Promise.all([
+          db`SELECT p.mint,l.symbol,COUNT(*)::int AS buys,MAX(p.bought_at) AS latest FROM reward_proofs p JOIN launches l ON l.mint=p.mint WHERE p.wallet=${owner} AND l.status='live' GROUP BY p.mint,l.symbol ORDER BY latest DESC LIMIT 50`,
+          db`SELECT e.mint,a.lamports,a.payout_signature,a.paid_at FROM reward_allocations a JOIN reward_epochs e ON e.id=a.epoch_id JOIN launches l ON l.mint=e.mint WHERE a.wallet=${owner} AND a.status='paid' AND (l.treasury_bps=0 OR a.wallet <> ${TREASURY_WALLET}) ORDER BY a.paid_at DESC LIMIT 50`
+        ]);
+        return json({wallet:owner,verifiedCoins:proofs.map((r:any)=>({mint:r.mint,symbol:r.symbol,verifiedBuys:r.buys,latest:r.latest})),paidRewards:payouts.map((r:any)=>({mint:r.mint,lamports:String(r.lamports),signature:r.payout_signature,at:r.paid_at})),scope:"Only indexed Fomo co-signed buys and Fomopad reward payouts. No profitability or trust score."});
+      }
+      const positionsRoute = path.match(/^\/api\/wallet\/([^/]+)\/positions$/);
+      if (positionsRoute && req.method === "GET") {
+        rate(req,"positions",30,60_000);
+        const owner = address(positionsRoute[1]).toBase58();
+        const accounts = await rpc.getParsedTokenAccountsByOwner(new PublicKey(owner),{programId:TOKEN_PROGRAM_ID},"confirmed");
+        const token2022 = await rpc.getParsedTokenAccountsByOwner(new PublicKey(owner),{programId:new PublicKey(TOKEN_2022)},"confirmed");
+        const held = [...accounts.value,...token2022.value].map(x=>x.account.data.parsed?.info).filter(x=>x?.tokenAmount && Number(x.tokenAmount.amount)>0);
+        const mints = [...new Set(held.map(x=>x.mint))].slice(0,100);
+        const launches = mints.length ? await db`SELECT mint,name,symbol,protocol FROM launches WHERE status='live' AND mint IN ${db(mints)} LIMIT 100` : [];
+        const holdings = await Promise.all(launches.map(async (r:any) => {
+          const amount = held.filter(x=>x.mint===r.mint).reduce((sum,x)=>sum+Number(x.tokenAmount.uiAmountString || 0),0);
+          const market = await marketFor(r.mint);
+          return {mint:r.mint,name:r.name,symbol:r.symbol,protocol:r.protocol,balance:amount,priceUsd:market?.priceUsd ?? null,valueUsd:market?.priceUsd == null ? null : amount*market.priceUsd};
+        }));
+        return json({wallet:owner,holdings,scope:"Current balances of verified Fomopad coins; price estimates from DEX Screener. Cost basis and P&L are unavailable without complete wallet trade history."});
+      }
+      const tradesRoute = path.match(/^\/api\/tokens\/([^/]+)\/trades$/);
+      if (tradesRoute && req.method === "GET") {
+        rate(req,"live-trades",60,60_000);
+        const mint = mintAddress(tradesRoute[1]).toBase58();
+        const launch = await db`SELECT mint,pool FROM launches WHERE mint=${mint} AND status='live' LIMIT 1`;
+        if (!launch.length) return fail("Verified launch not found",404);
+        const market = await marketFor(mint);
+        const pool = market?.pair || launch[0].pool;
+        if (!pool) return json({trades:[],state:"awaiting-pool"});
+        const cached = tradeCache.get(pool);
+        if (cached && cached.expires>Date.now()) return json(cached.value);
+        let value:any = {trades:[],state:"awaiting-index",source:"GeckoTerminal",pool};
+        try {
+          const response=await fetch(`https://api.geckoterminal.com/api/v2/networks/solana/pools/${pool}/trades`,{headers:{accept:"application/json;version=20230203"},signal:AbortSignal.timeout(6500)});
+          if (response.ok) {
+            const result=await response.json();
+            const rows=Array.isArray(result.data)?result.data:[];
+            value={source:"GeckoTerminal",pool,state:"ready",trades:rows.slice(0,30).map((x:any)=>({kind:x.attributes?.kind === "buy" ? "buy" : x.attributes?.kind === "sell" ? "sell" : "trade",volumeUsd:Number(x.attributes?.volume_in_usd),priceUsd:Number(x.attributes?.price_to_in_usd || x.attributes?.price_from_in_usd),at:x.attributes?.block_timestamp,signature:x.attributes?.tx_hash})).filter((x:any)=>/^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(x.signature) && Number.isFinite(x.volumeUsd) && x.volumeUsd>=0)};
+          }
+        } catch {}
+        tradeCache.set(pool,{expires:Date.now()+30_000,value});
+        return json(value);
       }
       if (path.startsWith("/api/creator/") && req.method === "GET") {
         const creator = address(path.slice(13)).toBase58();
