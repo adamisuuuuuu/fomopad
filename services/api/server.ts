@@ -110,6 +110,11 @@ if (db) {
     created_at timestamptz NOT NULL DEFAULT now(), completed_at timestamptz
   )`;
   await db`CREATE UNIQUE INDEX IF NOT EXISTS treasury_claim_one_open ON treasury_claim_epochs (mint) WHERE status IN ('sent','needs-review')`;
+  await db`CREATE TABLE IF NOT EXISTS creator_fee_claims (
+    signature text PRIMARY KEY, mint text NOT NULL REFERENCES launches(mint),
+    creator text NOT NULL, protocol text NOT NULL, claimed_at timestamptz NOT NULL DEFAULT now()
+  )`;
+  await db`CREATE INDEX IF NOT EXISTS creator_fee_claims_mint ON creator_fee_claims (mint, claimed_at DESC)`;
   await db`CREATE TABLE IF NOT EXISTS account_deletion_requests (wallet text PRIMARY KEY, requested_at timestamptz NOT NULL DEFAULT now(), status text NOT NULL DEFAULT 'pending')`;
   await db`CREATE TABLE IF NOT EXISTS auth_challenges (nonce_hash text PRIMARY KEY, wallet text NOT NULL, expires_at timestamptz NOT NULL)`;
   await db`CREATE TABLE IF NOT EXISTS auth_sessions (token_hash text PRIMARY KEY, wallet text NOT NULL, expires_at timestamptz NOT NULL)`;
@@ -440,7 +445,7 @@ Bun.serve({
         const owner = address(walletRewards[1]).toBase58();
         const [proofs, allocations] = await Promise.all([
           db`SELECT p.mint, l.name, l.symbol, l.reward_scope, SUM(p.bought_amount)::text AS bought_amount, MAX(p.bought_at) AS last_seen_at FROM reward_proofs p JOIN launches l ON l.mint=p.mint WHERE p.wallet=${owner} AND l.status='live' GROUP BY p.mint,l.name,l.symbol,l.reward_scope ORDER BY last_seen_at DESC LIMIT 50`,
-          db`SELECT e.mint, a.lamports, a.status, a.payout_signature, a.paid_at FROM reward_allocations a JOIN reward_epochs e ON e.id=a.epoch_id WHERE a.wallet=${owner} ORDER BY e.id DESC LIMIT 100`
+          db`SELECT e.mint, a.lamports, a.status, a.payout_signature, a.paid_at FROM reward_allocations a JOIN reward_epochs e ON e.id=a.epoch_id JOIN launches l ON l.mint=e.mint WHERE a.wallet=${owner} AND (l.treasury_bps=0 OR a.wallet <> ${TREASURY_WALLET}) ORDER BY e.id DESC LIMIT 100`
         ]);
         return json({wallet:owner,verifiedBuys:proofs.map((r:any)=>({mint:r.mint,name:r.name,symbol:r.symbol,rewardScope:r.reward_scope,boughtAmount:String(r.bought_amount),lastSeenAt:r.last_seen_at})),allocations:allocations.map((r:any)=>({mint:r.mint,lamports:String(r.lamports),status:r.status,signature:r.payout_signature,paidAt:r.paid_at})),note:"Historical verified buys do not guarantee future holder payouts; holder balances are checked at each reward snapshot."});
       }
@@ -502,6 +507,7 @@ Bun.serve({
         if (state.mode === "stonk-claim") {
           if (!signers.includes(state.creator) || !instructions.some(ix=>keys[ix.programIdIndex]===state.program && Buffer.from(ix.data).equals(STONK_CREATOR_CLAIM_DISCRIMINATOR) && ix.accounts.length===8 && keys[ix.accounts[0]]===state.creator && keys[ix.accounts[1]]===getPdaCreatorFeeVaultAuth(LAUNCHPAD_PROGRAM).publicKey.toBase58() && keys[ix.accounts[2]]===state.vault && keys[ix.accounts[3]]===state.receiver && keys[ix.accounts[4]]===state.quoteMint && keys[ix.accounts[5]]===TOKEN_PROGRAM_ID.toBase58() && keys[ix.accounts[6]]===SystemProgram.programId.toBase58() && keys[ix.accounts[7]]===ASSOCIATED_TOKEN_PROGRAM_ID.toBase58())) return fail("Stonk.fun claim receipt does not match this creator vault",422);
         } else if (!signers.includes(state.creator) || !keys.includes(state.pool) || !instructions.some(ix=>keys[ix.programIdIndex]===DBC_PROGRAM.toBase58() && Buffer.from(ix.data).subarray(0,8).equals(CREATOR_CLAIM_DISCRIMINATOR) && [...ix.accounts].some((i:number)=>keys[i]===state.pool))) return fail("Claim receipt does not match this coin and creator",422);
+        await db`INSERT INTO creator_fee_claims (signature,mint,creator,protocol) VALUES (${sig},${mint},${state.creator},${state.mode === "stonk-claim" ? "STONK" : "DBC"}) ON CONFLICT DO NOTHING`;
         return json({status:"confirmed",signature:sig,claimableQuoteLamports:state.claimableQuoteLamports});
       }
 
@@ -604,6 +610,26 @@ Bun.serve({
         const totals = new Map(paid.map((r: any) => [r.mint, r.lamports]));
         const out = await Promise.all(records.map(async r => ({ ...row(r), market: await marketFor(r.mint), curve: await boardCurveFor(r), rewardPaidLamports:totals.get(r.mint) || "0" })));
         return json({ tokens: out, scope:"50 most recent verified launches" });
+      }
+      const feeLedgerRoute = path.match(/^\/api\/tokens\/([^/]+)\/fees$/);
+      if (feeLedgerRoute && req.method === "GET") {
+        const mint = mintAddress(feeLedgerRoute[1]).toBase58();
+        const launch = await db`SELECT mint,creator,protocol,reward_mode,reward_scope,treasury_bps FROM launches WHERE mint=${mint} AND status='live' LIMIT 1`;
+        if (!launch.length) return fail("Verified launch not found",404);
+        const [creatorClaims, epochs, allocations, treasuryClaims] = await Promise.all([
+          db`SELECT signature,claimed_at FROM creator_fee_claims WHERE mint=${mint} ORDER BY claimed_at DESC LIMIT 50`,
+          db`SELECT claim_signature,claimed_lamports,status,created_at FROM reward_epochs WHERE mint=${mint} ORDER BY id DESC LIMIT 50`,
+          db`SELECT a.wallet,a.lamports,a.status,a.payout_signature,a.paid_at FROM reward_allocations a JOIN reward_epochs e ON e.id=a.epoch_id WHERE e.mint=${mint} ORDER BY e.id DESC LIMIT 100`,
+          db`SELECT signature,expected_lamports,status,created_at FROM treasury_claim_epochs WHERE mint=${mint} ORDER BY id DESC LIMIT 50`
+        ]);
+        const isTreasury = (wallet:string) => Number(launch[0].treasury_bps || 0) > 0 && wallet === TREASURY_WALLET;
+        const events = [
+          ...creatorClaims.map((r:any)=>({kind:"creator-claim",wallet:launch[0].creator,signature:r.signature,at:r.claimed_at,status:"confirmed",amountLamports:null})),
+          ...epochs.map((r:any)=>({kind:"reward-fee-claim",wallet:null,signature:r.claim_signature,at:r.created_at,status:r.status,amountLamports:r.claimed_lamports === null ? null : String(r.claimed_lamports)})),
+          ...allocations.map((r:any)=>({kind:isTreasury(r.wallet) ? "team-treasury" : "trader-payout",wallet:r.wallet,signature:r.payout_signature,at:r.paid_at,status:r.status,amountLamports:String(r.lamports)})),
+          ...treasuryClaims.map((r:any)=>({kind:"team-treasury",wallet:TREASURY_WALLET,signature:r.signature,at:r.created_at,status:r.status,amountLamports:String(r.expected_lamports)}))
+        ].sort((a,b)=>new Date(b.at || 0).getTime()-new Date(a.at || 0).getTime());
+        return json({mint,protocol:launch[0].protocol,route:launch[0].reward_mode ? launch[0].reward_scope : "creator",treasuryBps:Number(launch[0].treasury_bps || 0),treasuryWallet:Number(launch[0].treasury_bps || 0) ? TREASURY_WALLET : null,events,scope:"Fomopad-recorded receipts; historical creator claims before this ledger are not included",amountNote:"Creator claim amounts are not recorded here; inspect their Solana receipts."});
       }
       if (path.startsWith("/api/creator/") && req.method === "GET") {
         const creator = address(path.slice(13)).toBase58();
