@@ -2,6 +2,7 @@ import postgres from "postgres";
 import { Connection, Keypair, PublicKey, Transaction, SystemProgram } from "@solana/web3.js";
 import BN from "bn.js";
 import * as DBC from "@meteora-ag/dynamic-bonding-curve-sdk";
+import webpush from "web-push";
 
 const RPC = Bun.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
 const REWARD_AUTHORITY = Bun.env.FOMOPAD_REWARD_AUTHORITY ? new PublicKey(Bun.env.FOMOPAD_REWARD_AUTHORITY).toBase58() : null;
@@ -384,6 +385,48 @@ async function advanceTreasury(mint: string) {
   return result;
 }
 
+async function processPushAlerts() {
+  if (!db || !Bun.env.FOMOPAD_VAPID_PUBLIC || !Bun.env.FOMOPAD_VAPID_PRIVATE) return;
+  webpush.setVapidDetails("mailto:team@fomopad.name",Bun.env.FOMOPAD_VAPID_PUBLIC,Bun.env.FOMOPAD_VAPID_PRIVATE);
+  const subscriptions=await db`SELECT * FROM push_subscriptions ORDER BY updated_at ASC LIMIT 100`;
+  if (!subscriptions.length) return;
+  const response=await fetch("https://fomopad-api-production.up.railway.app/api/tokens",{signal:AbortSignal.timeout(25_000)});
+  if (!response.ok) throw new Error("Alert market board unavailable");
+  const board=await response.json(), tokens=new Map((board.tokens || []).map((t:any)=>[t.mint,t]));
+  const watched=[...new Set(subscriptions.flatMap((s:any)=>s.watch_mints || []))].filter(m=>tokens.has(m)).slice(0,25);
+  const trades=new Map<string,any[]>();
+  for(const mint of watched.slice(0,10)) {
+    try {
+      const res=await fetch("https://fomopad-api-production.up.railway.app/api/tokens/"+mint+"/trades",{signal:AbortSignal.timeout(10_000)});
+      if(res.ok)trades.set(mint,(await res.json()).trades || []);
+    } catch {}
+  }
+  for(const sub of subscriptions) {
+    try {
+      const alerts:any[]=[];
+      for(const mint of (sub.watch_mints || []).slice(0,15)) {
+        const t:any=tokens.get(mint);if(!t)continue;
+        const symbol=String(t.symbol || 'coin').slice(0,12);
+        if(t.curve?.migrated) alerts.push({id:'graduated:'+mint,title:'Graduated · $'+symbol,body:'The DBC curve migrated.',mint});
+        else if(Number(t.curve?.progressPercent)>=90)alerts.push({id:'near:'+mint+':'+Math.floor(Date.now()/3600000),title:'Near graduation · $'+symbol,body:Number(t.curve.progressPercent).toFixed(1)+'% of the DBC curve target.',mint});
+        if(t.market?.volume5mUsd!=null && Number(t.market.volume5mUsd)>=Number(sub.volume_usd))alerts.push({id:'volume:'+mint+':'+Math.floor(Date.now()/300000),title:'5m volume · $'+symbol,body:'$'+Math.round(t.market.volume5mUsd).toLocaleString()+' in five minutes.',mint});
+        if(t.market?.change1hPct!=null && Math.abs(Number(t.market.change1hPct))>=Number(sub.change_pct))alerts.push({id:'price:'+mint+':'+Math.floor(Date.now()/3600000),title:'1h move · $'+symbol,body:Number(t.market.change1hPct).toFixed(1)+'% in one hour.',mint});
+        for(const trade of (trades.get(mint)||[]).filter((x:any)=>x.kind==='buy' && Number(x.volumeUsd)>=Number(sub.buy_usd)).slice(0,3))alerts.push({id:'buy:'+trade.signature,title:'Large buy · $'+symbol,body:'$'+Math.round(trade.volumeUsd).toLocaleString()+' pool trade.',mint});
+      }
+      const payouts=await db`SELECT a.payout_signature AS signature,e.mint,a.lamports FROM reward_allocations a JOIN reward_epochs e ON e.id=a.epoch_id WHERE a.wallet=${sub.wallet} AND a.status='paid' AND a.payout_signature IS NOT NULL ORDER BY a.paid_at DESC LIMIT 5`;
+      for(const p of payouts)alerts.push({id:'reward:'+p.signature,title:'Fomo reward paid',body:(Number(p.lamports)/1e9).toFixed(6)+' SOL received.',mint:p.mint});
+      const previous=Array.isArray(sub.state?.seen)?sub.state.seen:[],known=new Set(previous),ids=[...new Set([...previous,...alerts.map(x=>x.id)])].slice(-250);
+      // First scan establishes a baseline so enabling notifications does not flood a wallet.
+      if(sub.state?.initialized)for(const alert of alerts.filter(a=>!known.has(a.id)).slice(0,4)) {
+        try {await webpush.sendNotification({endpoint:sub.endpoint,keys:{p256dh:sub.p256dh,auth:sub.auth}},JSON.stringify({title:alert.title,body:alert.body,url:'https://fomopad.name/#token/'+alert.mint,tag:alert.id}),{TTL:600});}
+        catch(err:any){if([404,410].includes(err.statusCode)){await db`DELETE FROM push_subscriptions WHERE endpoint_hash=${sub.endpoint_hash}`;break;}throw err;}
+      }
+      await db`UPDATE push_subscriptions SET state=${JSON.stringify({initialized:true,seen:ids})}::jsonb,updated_at=now() WHERE endpoint_hash=${sub.endpoint_hash}`;
+    } catch(err:any){console.error('Push alert deferred',sub.endpoint_hash,err?.message||err);}
+  }
+  console.log('Push alert subscriptions checked',subscriptions.length);
+}
+
 // A private Railway cron function runs every five minutes. It has no HTTP listener or public domain.
 // Only this worker receives the signing seed; the website API holds the public authority address.
 try {
@@ -412,5 +455,6 @@ try {
       } catch (err:any) { console.error('Treasury settlement deferred',item.mint,err?.message || err); }
     }
   }
+  try {await processPushAlerts();} catch(err:any){console.error('Push alerts deferred',err?.message||err);}
 } finally { if (db) await db.end(); }
 

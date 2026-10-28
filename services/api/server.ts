@@ -116,6 +116,14 @@ if (db) {
     creator text NOT NULL, protocol text NOT NULL, claimed_at timestamptz NOT NULL DEFAULT now()
   )`;
   await db`CREATE INDEX IF NOT EXISTS creator_fee_claims_mint ON creator_fee_claims (mint, claimed_at DESC)`;
+  await db`CREATE TABLE IF NOT EXISTS push_subscriptions (
+    endpoint_hash text PRIMARY KEY, wallet text NOT NULL, endpoint text NOT NULL,
+    p256dh text NOT NULL, auth text NOT NULL, watch_mints text[] NOT NULL DEFAULT '{}',
+    volume_usd numeric NOT NULL DEFAULT 10000, buy_usd numeric NOT NULL DEFAULT 1000,
+    change_pct numeric NOT NULL DEFAULT 15, state jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now()
+  )`;
+  await db`CREATE INDEX IF NOT EXISTS push_subscriptions_wallet ON push_subscriptions (wallet)`;
   await db`CREATE TABLE IF NOT EXISTS account_deletion_requests (wallet text PRIMARY KEY, requested_at timestamptz NOT NULL DEFAULT now(), status text NOT NULL DEFAULT 'pending')`;
   await db`CREATE TABLE IF NOT EXISTS auth_challenges (nonce_hash text PRIMARY KEY, wallet text NOT NULL, expires_at timestamptz NOT NULL)`;
   await db`CREATE TABLE IF NOT EXISTS auth_sessions (token_hash text PRIMARY KEY, wallet text NOT NULL, expires_at timestamptz NOT NULL)`;
@@ -418,6 +426,7 @@ Bun.serve({
         return json({ ok: true, database: true, chain: "solana-mainnet", protocols: ["meteora-dbc", "stonk-launchlab"], rewards: REWARDS_ENABLED ? "bonding-fee-mode" : "unavailable" });
       }
       if (path === "/api/config") return json({ chain: "solana-mainnet", protocols: ["Meteora DBC", "Stonk.fun / Raydium LaunchLab"], suffix: "fomo", minInitialMarketCapSol: 30, migrationQuoteThresholdSol: DBC_THRESHOLD_SOL, tradingFeeBps: 100, graduation: "DAMM v2", fomoOnlyRewards: REWARDS_ENABLED ? "opt-in-dbc-bonding-fees" : "unavailable", rewardVaultAuthority: REWARD_AUTHORITY, dbcTreasuryBps:TREASURY_BPS, dbcTreasuryWallet:TREASURY_WALLET, stonkTreasuryShareSupported:false });
+      if (path === "/api/push/config" && req.method === "GET") return json({ available:!!Bun.env.FOMOPAD_VAPID_PUBLIC, publicKey:Bun.env.FOMOPAD_VAPID_PUBLIC || null, cadence:"about five minutes", scope:"signed-in wallet watchlist; installed PWA needed on iPhone" });
       if (path === "/api/stonk/terms" && req.method === "GET") {
         const { pair, pricing } = await stonkTerms();
         return json({ available: true, quote: { mint: pair.mint, symbol: pair.symbol || "SOL", tokenProgram: pair.tokenProgram }, mode: "standard", program: pricing.curve.programId, config: pricing.curve.configId, platform: pricing.platform.standard, openingMarketCap: pricing.marketCap?.startQuote || null, graduationMarketCap: pricing.marketCap?.graduationQuote || null, raiseRaw: pricing.raise.raw, raiseSol: pricing.raise.units || null });
@@ -432,6 +441,33 @@ Bun.serve({
           explanation: "Only new opt-in launches route their bonding-curve fee share to this authority. The authority needs SOL for claim and payout transaction fees. Do not send launch or trading funds here." });
       }
       if (!db) return fail("Database is not configured", 503);
+      if (path === "/api/push/subscription" && ["POST","DELETE"].includes(req.method)) {
+        rate(req,"push-subscription",20,3_600_000);
+        const owner=await signedInWallet(req);
+        if (!owner) return fail("Sign in with your wallet to manage push alerts",401);
+        const input=await body(req);
+        const endpoint=String(input?.subscription?.endpoint || "");
+        const url=new URL(endpoint);
+        if (url.protocol!=="https:" || !/^(fcm\.googleapis\.com|updates\.push\.services\.mozilla\.com|web\.push\.apple\.com|[a-z0-9.-]+\.push\.apple\.com)$/.test(url.hostname) || endpoint.length>1000) return fail("Unsupported browser push endpoint");
+        const hash=createHash("sha256").update(endpoint).digest("hex");
+        if (req.method==="DELETE") {
+          await db`DELETE FROM push_subscriptions WHERE endpoint_hash=${hash} AND wallet=${owner}`;
+          return json({enabled:false});
+        }
+        if (!Bun.env.FOMOPAD_VAPID_PUBLIC) return fail("Background alerts are not configured",503);
+        const p256dh=String(input.subscription?.keys?.p256dh || ""), auth=String(input.subscription?.keys?.auth || "");
+        if (!/^[A-Za-z0-9_-]{60,120}$/.test(p256dh) || !/^[A-Za-z0-9_-]{15,50}$/.test(auth)) return fail("Invalid browser push keys");
+        const existing=await db`SELECT count(*)::int AS total FROM push_subscriptions WHERE wallet=${owner} AND endpoint_hash<>${hash}`;
+        if(existing[0].total>=5)return fail("Maximum five devices per wallet",429);
+        const mints=Array.isArray(input.watchMints) ? [...new Set(input.watchMints)].slice(0,15).map((x:any)=>mintAddress(x).toBase58()) : [];
+        const volume=Number(input.volumeUsd),buy=Number(input.buyUsd),change=Number(input.changePct);
+        if ([volume,buy,change].some(x=>!Number.isFinite(x)||x<=0||x>1e9)) return fail("Invalid alert thresholds");
+        await db`INSERT INTO push_subscriptions (endpoint_hash,wallet,endpoint,p256dh,auth,watch_mints,volume_usd,buy_usd,change_pct)
+          VALUES (${hash},${owner},${endpoint},${p256dh},${auth},${db.array(mints)},${volume},${buy},${change})
+          ON CONFLICT(endpoint_hash) DO UPDATE SET wallet=EXCLUDED.wallet,p256dh=EXCLUDED.p256dh,auth=EXCLUDED.auth,watch_mints=EXCLUDED.watch_mints,
+          volume_usd=EXCLUDED.volume_usd,buy_usd=EXCLUDED.buy_usd,change_pct=EXCLUDED.change_pct,updated_at=now()`;
+        return json({enabled:true,watchCount:mints.length});
+      }
       if (path === "/api/activity" && req.method === "GET") {
         const [launches, payouts] = await Promise.all([
           db`SELECT mint, name, symbol, creator, protocol, signature, launched_at FROM launches WHERE status = 'live' ORDER BY launched_at DESC LIMIT 25`,
@@ -442,6 +478,28 @@ Bun.serve({
         return json({events,scope:"verified launches and paid Fomo reward receipts",updatedAt:new Date().toISOString()});
       }
       const walletRewards = path.match(/^\/api\/wallet\/([^/]+)\/rewards$/);
+      const tradeReceipt = path.match(/^\/api\/trade-receipt\/([^/]+)\/([^/]+)$/);
+      if (tradeReceipt && req.method === "GET") {
+        rate(req,"trade-receipt",25,60_000);
+        const mint=mintAddress(tradeReceipt[1]).toBase58(), signature=tradeReceipt[2];
+        const owner=address(u.searchParams.get("wallet") || "").toBase58();
+        if (!/^[1-9A-HJ-NP-Za-km-z]{64,88}$/.test(signature)) return fail("Invalid transaction signature");
+        const launches=await db`SELECT mint,name,symbol,pool FROM launches WHERE mint=${mint} AND status='live' LIMIT 1`;
+        if (!launches.length) return fail("Verified launch not found",404);
+        const response=await fetch(RPC,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({jsonrpc:"2.0",id:1,method:"getTransaction",params:[signature,{encoding:"jsonParsed",commitment:"confirmed",maxSupportedTransactionVersion:1}]}),signal:AbortSignal.timeout(12_000)});
+        if (!response.ok) return fail("Solana receipt temporarily unavailable",503);
+        const raw=await response.json(), tx=raw.result;
+        if (!tx || tx.meta?.err) return fail("Confirmed successful trade receipt not found",404);
+        const keys=tx.transaction?.message?.accountKeys || [];
+        if (!keys.some((k:any)=>k.pubkey===owner && k.signer) || !keys.some((k:any)=>k.pubkey===launches[0].pool)) return fail("Wallet signature or launch pool not present in this receipt",422);
+        const sum=(items:any[])=>items.filter(x=>x.mint===mint && x.owner===owner).reduce((n,x)=>n+BigInt(x.uiTokenAmount?.amount || "0"),0n);
+        const pre=sum(tx.meta.preTokenBalances || []), post=sum(tx.meta.postTokenBalances || []), diff=post-pre;
+        if (!diff) return fail("No token balance change for this wallet",422);
+        const item=[...(tx.meta.postTokenBalances || []),...(tx.meta.preTokenBalances || [])].find(x=>x.mint===mint && x.owner===owner);
+        const decimals=Number(item?.uiTokenAmount?.decimals || 0);
+        const verifiedFomo=(await db`SELECT 1 FROM reward_proofs WHERE mint=${mint} AND wallet=${owner} AND signature=${signature} LIMIT 1`).length>0;
+        return json({verified:true,kind:diff>0n?"buy":"sell",wallet:owner,signature,mint,name:launches[0].name,symbol:launches[0].symbol,rawTokenChange:diff.toString(),tokenChange:Number(diff)/10**decimals,decimals,blockTime:tx.blockTime ? new Date(tx.blockTime*1000).toISOString():null,verifiedFomo,scope:"Confirmed Solana transaction, wallet signer, launch pool, and token balance delta. Quote spent and profit are not inferred."});
+      }
       if (walletRewards && req.method === "GET") {
         const owner = address(walletRewards[1]).toBase58();
         const [proofs, allocations] = await Promise.all([
