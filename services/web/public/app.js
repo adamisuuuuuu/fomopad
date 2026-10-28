@@ -588,8 +588,8 @@ async function alertsPage() {
     if (!signedWallet || !authToken) return toast("Sign in with your wallet to enable background alerts.");
     if (!("Notification" in window) || !("serviceWorker" in navigator) || !("PushManager" in window)) return toast("Background alerts are unavailable here. On iPhone, install the home-screen app first.");
     try {
-      const config=await request('/api/push/config');if(!config.available||!config.publicKey)throw Error('Background alerts are not configured yet');
       const state=await Notification.requestPermission();if(state!=='granted')return toast('Notification permission was not granted.');
+      const config=await request('/api/push/config');if(!config.available||!config.publicKey)throw Error('Background alerts are not configured yet');
       const registration=await navigator.serviceWorker.ready;
       await (await registration.pushManager.getSubscription() || await registration.pushManager.subscribe({userVisibleOnly:true,applicationServerKey:pushKeyBytes(config.publicKey)}));
       await syncPushSubscription();$("#pushStatus").textContent='Background alerts active · scans about every five minutes · '+watch.size+' watched coin(s).';toast('Background alerts enabled for this wallet.');
